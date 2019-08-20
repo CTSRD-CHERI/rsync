@@ -28,7 +28,7 @@ extern int dry_run;
 extern int am_root;
 extern int read_only;
 extern int list_only;
-extern int orig_umask;
+extern mode_t orig_umask;
 extern int numeric_ids;
 extern int inc_recurse;
 extern int preserve_devices;

@@ -3,7 +3,7 @@
  *
  * Copyright (C) 1996-2000 Andrew Tridgell
  * Copyright (C) 1996 Paul Mackerras
- * Copyright (C) 2003-2019 Wayne Davison
+ * Copyright (C) 2003-2022 Wayne Davison
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,7 +39,9 @@ extern int protocol_version;
 extern int relative_paths;
 extern int preserve_hard_links;
 extern int preserve_perms;
+extern int write_devices;
 extern int preserve_xattrs;
+extern int do_fsync;
 extern int basis_dir_cnt;
 extern int make_backups;
 extern int cleanup_got_literal;
@@ -51,9 +53,11 @@ extern int keep_partial;
 extern int checksum_seed;
 extern int whole_file;
 extern int inplace;
+extern int inplace_partial;
 extern int allowed_lull;
 extern int delay_updates;
 extern int xfersum_type;
+extern BOOL want_progress_now;
 extern mode_t orig_umask;
 extern struct stats stats;
 extern char *tmpdir;
@@ -67,7 +71,7 @@ extern OFF_T preallocated_len;
 static struct bitbag *delayed_bits = NULL;
 static int phase = 0, redoing = 0;
 static flist_ndx_list batch_redo_list;
-/* We're either updating the basis file or an identical copy: */
+/* This is non-0 when we are updating the basis file or an identical copy: */
 static int updating_basis_or_equiv;
 
 #define TMPNAME_SUFFIX ".XXXXXX"
@@ -231,13 +235,14 @@ int open_tmpfile(char *fnametmp, const char *fname, struct file_struct *file)
 }
 
 static int receive_data(int f_in, char *fname_r, int fd_r, OFF_T size_r,
-			const char *fname, int fd, OFF_T total_size)
+			const char *fname, int fd, struct file_struct *file, int inplace_sizing)
 {
 	static char file_sum1[MAX_DIGEST_LEN];
 	struct map_struct *mapbuf;
 	struct sum_struct sum;
 	int sum_len;
 	int32 len;
+	OFF_T total_size = F_LENGTH(file);
 	OFF_T offset = 0;
 	OFF_T offset2;
 	char *data;
@@ -245,14 +250,14 @@ static int receive_data(int f_in, char *fname_r, int fd_r, OFF_T size_r,
 	char *map = NULL;
 
 #ifdef SUPPORT_PREALLOCATION
-	if (preallocate_files && fd != -1 && total_size > 0 && (!inplace || total_size > size_r)) {
+	if (preallocate_files && fd != -1 && total_size > 0 && (!inplace_sizing || total_size > size_r)) {
 		/* Try to preallocate enough space for file's eventual length.  Can
 		 * reduce fragmentation on filesystems like ext4, xfs, and NTFS. */
 		if ((preallocated_len = do_fallocate(fd, 0, total_size)) < 0)
 			rsyserr(FWARNING, errno, "do_fallocate %s", full_fname(fname));
 	} else
 #endif
-	if (inplace) {
+	if (inplace_sizing) {
 #ifdef HAVE_FTRUNCATE
 		/* The most compatible way to create a sparse file is to start with no length. */
 		if (sparse_files > 0 && whole_file && fd >= 0 && do_ftruncate(fd, 0) == 0)
@@ -379,9 +384,9 @@ static int receive_data(int f_in, char *fname_r, int fd_r, OFF_T size_r,
 	/* inplace: New data could be shorter than old data.
 	 * preallocate_files: total_size could have been an overestimate.
 	 *     Cut off any extra preallocated zeros from dest file. */
-	if ((inplace || preallocated_len > offset) && fd != -1 && do_ftruncate(fd, offset) < 0) {
-		rsyserr(FERROR_XFER, errno, "ftruncate failed on %s",
-			full_fname(fname));
+	if ((inplace_sizing || preallocated_len > offset) && fd != -1 && !IS_DEVICE(file->mode)) {
+		if (do_ftruncate(fd, offset) < 0)
+			rsyserr(FERROR_XFER, errno, "ftruncate failed on %s", full_fname(fname));
 	}
 #endif
 
@@ -389,6 +394,11 @@ static int receive_data(int f_in, char *fname_r, int fd_r, OFF_T size_r,
 		end_progress(total_size);
 
 	sum_len = sum_end(file_sum1);
+
+	if (do_fsync && fd != -1 && fsync(fd) != 0) {
+		rsyserr(FERROR, errno, "fsync failed on %s", full_fname(fname));
+		exit_cleanup(RERR_FILEIO);
+	}
 
 	if (mapbuf)
 		unmap_file(mapbuf);
@@ -402,9 +412,9 @@ static int receive_data(int f_in, char *fname_r, int fd_r, OFF_T size_r,
 }
 
 
-static void discard_receive_data(int f_in, OFF_T length)
+static void discard_receive_data(int f_in, struct file_struct *file)
 {
-	receive_data(f_in, NULL, -1, 0, NULL, -1, length);
+	receive_data(f_in, NULL, -1, 0, NULL, -1, file, 0);
 }
 
 static void handle_delayed_updates(char *local_name)
@@ -515,7 +525,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 	int iflags, xlen;
 	char *fname, fbuf[MAXPATHLEN];
 	char xname[MAXPATHLEN];
-	char fnametmp[MAXPATHLEN];
+	char *fnametmp, fnametmpbuf[MAXPATHLEN];
 	char *fnamecmp, *partialptr;
 	char fnamecmpbuf[MAXPATHLEN];
 	uchar fnamecmp_type;
@@ -527,13 +537,18 @@ int recv_files(int f_in, int f_out, char *local_name)
 #ifdef SUPPORT_ACLS
 	const char *parent_dirname = "";
 #endif
-	int ndx, recv_ok;
+	int ndx, recv_ok, one_inplace;
 
 	if (DEBUG_GTE(RECV, 1))
 		rprintf(FINFO, "recv_files(%d) starting\n", cur_flist->used);
 
 	if (delay_updates)
 		delayed_bits = bitbag_create(cur_flist->used + 1);
+
+	if (whole_file < 0)
+		whole_file = 0;
+
+	progress_init();
 
 	while (1) {
 		cleanup_disable();
@@ -542,9 +557,10 @@ int recv_files(int f_in, int f_out, char *local_name)
 		ndx = read_ndx_and_attrs(f_in, f_out, &iflags, &fnamecmp_type,
 					 xname, &xlen);
 		if (ndx == NDX_DONE) {
-			if (!am_server && INFO_GTE(PROGRESS, 2) && cur_flist) {
+			if (!am_server && cur_flist) {
 				set_current_file_index(NULL, 0);
-				end_progress(0);
+				if (INFO_GTE(PROGRESS, 2))
+					end_progress(0);
 			}
 			if (inc_recurse && first_flist) {
 				if (read_batch) {
@@ -644,7 +660,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 				stats.created_files++;
 		}
 
-		if (!am_server && INFO_GTE(PROGRESS, 1))
+		if (!am_server)
 			set_current_file_index(file, ndx);
 		stats.xferred_files++;
 		stats.total_transferred_size += F_LENGTH(file);
@@ -660,7 +676,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 					"(Skipping batched update for%s \"%s\")\n",
 					redoing ? " resend of" : "",
 					fname);
-				discard_receive_data(f_in, F_LENGTH(file));
+				discard_receive_data(f_in, file);
 				file->flags |= FLAG_FILE_SENT;
 				continue;
 			}
@@ -671,13 +687,13 @@ int recv_files(int f_in, int f_out, char *local_name)
 		if (!do_xfers) { /* log the transfer */
 			log_item(FCLIENT, file, iflags, NULL);
 			if (read_batch)
-				discard_receive_data(f_in, F_LENGTH(file));
+				discard_receive_data(f_in, file);
 			continue;
 		}
 		if (write_batch < 0) {
 			log_item(FCLIENT, file, iflags, NULL);
 			if (!am_server)
-				discard_receive_data(f_in, F_LENGTH(file));
+				discard_receive_data(f_in, file);
 			if (inc_recurse)
 				send_msg_int(MSG_SUCCESS, ndx);
 			continue;
@@ -746,6 +762,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 		if (fd1 == -1 && protocol_version < 29) {
 			if (fnamecmp != fname) {
 				fnamecmp = fname;
+				fnamecmp_type = FNAMECMP_FNAME;
 				fd1 = do_open(fnamecmp, O_RDONLY, 0);
 			}
 
@@ -754,12 +771,14 @@ int recv_files(int f_in, int f_out, char *local_name)
 				pathjoin(fnamecmpbuf, sizeof fnamecmpbuf,
 					 basis_dir[0], fname);
 				fnamecmp = fnamecmpbuf;
+				fnamecmp_type = FNAMECMP_BASIS_DIR_LOW;
 				fd1 = do_open(fnamecmp, O_RDONLY, 0);
 			}
 		}
 
-		updating_basis_or_equiv = inplace
-		    && (fnamecmp == fname || fnamecmp_type == FNAMECMP_BACKUP);
+		one_inplace = inplace_partial && fnamecmp_type == FNAMECMP_PARTIAL_DIR;
+		updating_basis_or_equiv = one_inplace
+		    || (inplace && (fnamecmp == fname || fnamecmp_type == FNAMECMP_BACKUP));
 
 		if (fd1 == -1) {
 			st.st_mode = 0;
@@ -767,7 +786,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 		} else if (do_fstat(fd1,&st) != 0) {
 			rsyserr(FERROR_XFER, errno, "fstat %s failed",
 				full_fname(fnamecmp));
-			discard_receive_data(f_in, F_LENGTH(file));
+			discard_receive_data(f_in, file);
 			close(fd1);
 			if (inc_recurse)
 				send_msg_int(MSG_NO_SEND, ndx);
@@ -782,17 +801,20 @@ int recv_files(int f_in, int f_out, char *local_name)
 			 */
 			rprintf(FERROR_XFER, "recv_files: %s is a directory\n",
 				full_fname(fnamecmp));
-			discard_receive_data(f_in, F_LENGTH(file));
+			discard_receive_data(f_in, file);
 			close(fd1);
 			if (inc_recurse)
 				send_msg_int(MSG_NO_SEND, ndx);
 			continue;
 		}
 
-		if (fd1 != -1 && !S_ISREG(st.st_mode)) {
+		if (fd1 != -1 && !(S_ISREG(st.st_mode) || (write_devices && IS_DEVICE(st.st_mode)))) {
 			close(fd1);
 			fd1 = -1;
 		}
+
+		if (fd1 != -1 && IS_DEVICE(st.st_mode) && st.st_size == 0)
+			st.st_size = get_device_size(fd1, fname);
 
 		/* If we're not preserving permissions, change the file-list's
 		 * mode based on the local permissions and some heuristics. */
@@ -806,26 +828,33 @@ int recv_files(int f_in, int f_out, char *local_name)
 				parent_dirname = dn;
 			}
 #endif
-			file->mode = dest_mode(file->mode, st.st_mode,
-					       dflt_perms, exists);
+			file->mode = dest_mode(file->mode, st.st_mode, dflt_perms, exists);
 		}
 
 		/* We now check to see if we are writing the file "inplace" */
-		if (inplace)  {
-			fd2 = do_open(fname, O_WRONLY|O_CREAT, 0600);
+		if (inplace || one_inplace)  {
+			fnametmp = one_inplace ? partialptr : fname;
+			fd2 = do_open(fnametmp, O_WRONLY|O_CREAT, 0600);
+#ifdef linux
+			if (fd2 == -1 && errno == EACCES) {
+				/* Maybe the error was due to protected_regular setting? */
+				fd2 = do_open(fname, O_WRONLY, 0600);
+			}
+#endif
 			if (fd2 == -1) {
 				rsyserr(FERROR_XFER, errno, "open %s failed",
-					full_fname(fname));
+					full_fname(fnametmp));
 			} else if (updating_basis_or_equiv)
 				cleanup_set(NULL, NULL, file, fd1, fd2);
 		} else {
+			fnametmp = fnametmpbuf;
 			fd2 = open_tmpfile(fnametmp, fname, file);
 			if (fd2 != -1)
 				cleanup_set(fnametmp, partialptr, file, fd1, fd2);
 		}
 
 		if (fd2 == -1) {
-			discard_receive_data(f_in, F_LENGTH(file));
+			discard_receive_data(f_in, file);
 			if (fd1 != -1)
 				close(fd1);
 			if (inc_recurse)
@@ -840,10 +869,11 @@ int recv_files(int f_in, int f_out, char *local_name)
 			rprintf(FINFO, "%s\n", fname);
 
 		/* recv file data */
-		recv_ok = receive_data(f_in, fnamecmp, fd1, st.st_size,
-				       fname, fd2, F_LENGTH(file));
+		recv_ok = receive_data(f_in, fnamecmp, fd1, st.st_size, fname, fd2, file, inplace || one_inplace);
 
 		log_item(log_code, file, iflags, NULL);
+		if (want_progress_now)
+			instant_progress(fname);
 
 		if (fd1 != -1)
 			close(fd1);
@@ -856,19 +886,19 @@ int recv_files(int f_in, int f_out, char *local_name)
 		if ((recv_ok && (!delay_updates || !partialptr)) || inplace) {
 			if (partialptr == fname)
 				partialptr = NULL;
-			if (!finish_transfer(fname, fnametmp, fnamecmp,
-					     partialptr, file, recv_ok, 1))
+			if (!finish_transfer(fname, fnametmp, fnamecmp, partialptr, file, recv_ok, 1))
 				recv_ok = -1;
 			else if (fnamecmp == partialptr) {
-				do_unlink(partialptr);
+				if (!one_inplace)
+					do_unlink(partialptr);
 				handle_partial_dir(partialptr, PDIR_DELETE);
 			}
-		} else if (keep_partial && partialptr) {
+		} else if (keep_partial && partialptr && (!one_inplace || delay_updates)) {
 			if (!handle_partial_dir(partialptr, PDIR_CREATE)) {
 				rprintf(FERROR,
-				    "Unable to create partial-dir for %s -- discarding %s.\n",
-				    local_name ? local_name : f_name(file, NULL),
-				    recv_ok ? "completed file" : "partial file");
+					"Unable to create partial-dir for %s -- discarding %s.\n",
+					local_name ? local_name : f_name(file, NULL),
+					recv_ok ? "completed file" : "partial file");
 				do_unlink(fnametmp);
 				recv_ok = -1;
 			} else if (!finish_transfer(partialptr, fnametmp, fnamecmp, NULL,
@@ -879,7 +909,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 				recv_ok = 2;
 			} else
 				partialptr = NULL;
-		} else
+		} else if (!one_inplace)
 			do_unlink(fnametmp);
 
 		cleanup_disable();
@@ -897,7 +927,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 			break;
 		case 0: {
 			enum logcode msgtype = redoing ? FERROR_XFER : FWARNING;
-			if (msgtype == FERROR_XFER || INFO_GTE(NAME, 1)) {
+			if (msgtype == FERROR_XFER || INFO_GTE(NAME, 1) || stdout_format_has_i) {
 				char *errstr, *redostr, *keptstr;
 				if (!(keep_partial && partialptr) && !inplace)
 					keptstr = "discarded";
@@ -926,7 +956,7 @@ int recv_files(int f_in, int f_out, char *local_name)
 			} else if (inc_recurse)
 				send_msg_int(MSG_NO_SEND, ndx);
 			break;
-		    }
+		}
 		case -1:
 			if (inc_recurse)
 				send_msg_int(MSG_NO_SEND, ndx);

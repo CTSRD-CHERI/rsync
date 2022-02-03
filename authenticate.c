@@ -2,7 +2,7 @@
  * Support rsync daemon authentication.
  *
  * Copyright (C) 1998-2000 Andrew Tridgell
- * Copyright (C) 2002-2019 Wayne Davison
+ * Copyright (C) 2002-2020 Wayne Davison
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 
 #include "rsync.h"
 #include "itypes.h"
+#include "ifuncs.h"
 
 extern int read_only;
 extern char *password_file;
@@ -118,7 +119,7 @@ static const char *check_secret(int module, const char *user, const char *group,
 		if ((st.st_mode & 06) != 0) {
 			rprintf(FLOG, "secrets file must not be other-accessible (see strict modes option)\n");
 			ok = 0;
-		} else if (MY_UID() == 0 && st.st_uid != 0) {
+		} else if (MY_UID() == ROOT_UID && st.st_uid != ROOT_UID) {
 			rprintf(FLOG, "secrets file must be owned by root when running as root (see strict modes)\n");
 			ok = 0;
 		}
@@ -195,7 +196,7 @@ static const char *getpassf(const char *filename)
 			rprintf(FERROR, "ERROR: password file must not be other-accessible\n");
 			exit_cleanup(RERR_SYNTAX);
 		}
-		if (MY_UID() == 0 && st.st_uid != 0) {
+		if (MY_UID() == ROOT_UID && st.st_uid != ROOT_UID) {
 			rprintf(FERROR, "ERROR: password file must be owned by root when running as root\n");
 			exit_cleanup(RERR_SYNTAX);
 		}
@@ -226,7 +227,7 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 	char *users = lp_auth_users(module);
 	char challenge[MAX_DIGEST_LEN*2];
 	char line[BIGPATHBUFLEN];
-	char **auth_uid_groups = NULL;
+	const char **auth_uid_groups = NULL;
 	int auth_uid_groups_cnt = -1;
 	const char *err = NULL;
 	int group_match = -1;
@@ -250,8 +251,7 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 	}
 	*pass++ = '\0';
 
-	if (!(users = strdup(users)))
-		out_of_memory("auth_server");
+	users = strdup(users);
 
 	for (tok = strtok(users, " ,\t"); tok; tok = strtok(NULL, " ,\t")) {
 		char *opts;
@@ -287,8 +287,7 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 				else {
 					gid_t *gid_array = gid_list.items;
 					auth_uid_groups_cnt = gid_list.count;
-					if ((auth_uid_groups = new_array(char *, auth_uid_groups_cnt)) == NULL)
-						out_of_memory("auth_server");
+					auth_uid_groups = new_array(const char *, auth_uid_groups_cnt);
 					for (j = 0; j < auth_uid_groups_cnt; j++)
 						auth_uid_groups[j] = gid_to_group(gid_array[j]);
 				}
@@ -314,7 +313,7 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 	else if (opt_ch == 'd')
 		err = "denied by rule";
 	else {
-		char *group = group_match >= 0 ? auth_uid_groups[group_match] : NULL;
+		const char *group = group_match >= 0 ? auth_uid_groups[group_match] : NULL;
 		err = check_secret(module, line, group, challenge, pass);
 	}
 
@@ -325,7 +324,7 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 		int j;
 		for (j = 0; j < auth_uid_groups_cnt; j++) {
 			if (auth_uid_groups[j])
-				free(auth_uid_groups[j]);
+				free((char*)auth_uid_groups[j]);
 		}
 		free(auth_uid_groups);
 	}
@@ -357,12 +356,12 @@ void auth_client(int fd, const char *user, const char *challenge)
 		/* XXX: cyeoh says that getpass is deprecated, because
 		 * it may return a truncated password on some systems,
 		 * and it is not in the LSB.
-                 *
-                 * Andrew Klein says that getpassphrase() is present
-                 * on Solaris and reads up to 256 characters.
-                 *
-                 * OpenBSD has a readpassphrase() that might be more suitable.
-                 */
+		 *
+		 * Andrew Klein says that getpassphrase() is present
+		 * on Solaris and reads up to 256 characters.
+		 *
+		 * OpenBSD has a readpassphrase() that might be more suitable.
+		 */
 		pass = getpass("Password: ");
 	}
 

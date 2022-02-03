@@ -3,7 +3,7 @@
  *
  * Copyright (C) 1996 Andrew Tridgell
  * Copyright (C) 1996 Paul Mackerras
- * Copyright (C) 2003-2019 Wayne Davison
+ * Copyright (C) 2003-2022 Wayne Davison
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -35,6 +35,7 @@ extern int append_mode;
 extern int copy_links;
 extern int io_error;
 extern int flist_eof;
+extern int whole_file;
 extern int allowed_lull;
 extern int preserve_xattrs;
 extern int protocol_version;
@@ -42,9 +43,11 @@ extern int remove_source_files;
 extern int updating_basis_file;
 extern int make_backups;
 extern int inplace;
+extern int inplace_partial;
 extern int batch_fd;
 extern int write_batch;
 extern int file_old_total;
+extern BOOL want_progress_now;
 extern struct stats stats;
 extern struct file_list *cur_flist, *first_flist, *dir_flist;
 
@@ -63,13 +66,10 @@ BOOL extra_flist_sending_enabled;
  **/
 static struct sum_struct *receive_sums(int f)
 {
-	struct sum_struct *s;
-	int32 i;
+	struct sum_struct *s = new(struct sum_struct);
 	int lull_mod = protocol_version >= 31 ? 0 : allowed_lull * 5;
 	OFF_T offset = 0;
-
-	if (!(s = new(struct sum_struct)))
-		out_of_memory("receive_sums");
+	int32 i;
 
 	read_sum_head(f, s);
 
@@ -90,8 +90,7 @@ static struct sum_struct *receive_sums(int f)
 	if (s->count == 0)
 		return(s);
 
-	if (!(s->sums = new_array(struct sum_buf, s->count)))
-		out_of_memory("receive_sums");
+	s->sums = new_array(struct sum_buf, s->count);
 
 	for (i = 0; i < s->count; i++) {
 		s->sums[i].sum1 = read_int(f);
@@ -206,6 +205,11 @@ void send_files(int f_in, int f_out)
 	if (DEBUG_GTE(SEND, 1))
 		rprintf(FINFO, "send_files starting\n");
 
+	if (whole_file < 0)
+		whole_file = 0;
+
+	progress_init();
+
 	while (1) {
 		if (inc_recurse) {
 			send_extra_file_list(f_out, MIN_FILECNT_LOOKAHEAD);
@@ -218,9 +222,10 @@ void send_files(int f_in, int f_out)
 		extra_flist_sending_enabled = False;
 
 		if (ndx == NDX_DONE) {
-			if (!am_server && INFO_GTE(PROGRESS, 2) && cur_flist) {
+			if (!am_server && cur_flist) {
 				set_current_file_index(NULL, 0);
-				end_progress(0);
+				if (INFO_GTE(PROGRESS, 2))
+					end_progress(0);
 			}
 			if (inc_recurse && first_flist) {
 				file_old_total -= first_flist->used;
@@ -268,8 +273,7 @@ void send_files(int f_in, int f_out)
 
 		if (!(iflags & ITEM_TRANSFER)) {
 			maybe_log_item(file, iflags, itemizing, xname);
-			write_ndx_and_attrs(f_out, ndx, iflags, fname, file,
-					    fnamecmp_type, xname, xlen);
+			write_ndx_and_attrs(f_out, ndx, iflags, fname, file, fnamecmp_type, xname, xlen);
 			if (iflags & ITEM_IS_NEW) {
 				stats.created_files++;
 				if (S_ISREG(file->mode)) {
@@ -312,10 +316,10 @@ void send_files(int f_in, int f_out)
 				stats.created_files++;
 		}
 
-		updating_basis_file = inplace && (protocol_version >= 29
-			? fnamecmp_type == FNAMECMP_FNAME : make_backups <= 0);
+		updating_basis_file = (inplace_partial && fnamecmp_type == FNAMECMP_PARTIAL_DIR)
+		    || (inplace && (protocol_version >= 29 ? fnamecmp_type == FNAMECMP_FNAME : make_backups <= 0));
 
-		if (!am_server && INFO_GTE(PROGRESS, 1))
+		if (!am_server)
 			set_current_file_index(file, ndx);
 		stats.xferred_files++;
 		stats.total_transferred_size += F_LENGTH(file);
@@ -324,8 +328,7 @@ void send_files(int f_in, int f_out)
 
 		if (!do_xfers) { /* log the transfer */
 			log_item(FCLIENT, file, iflags, NULL);
-			write_ndx_and_attrs(f_out, ndx, iflags, fname, file,
-					    fnamecmp_type, xname, xlen);
+			write_ndx_and_attrs(f_out, ndx, iflags, fname, file, fnamecmp_type, xname, xlen);
 			continue;
 		}
 
@@ -338,9 +341,7 @@ void send_files(int f_in, int f_out)
 		fd = do_open(fname, O_RDONLY, 0);
 		if (fd == -1) {
 			if (errno == ENOENT) {
-				enum logcode c = am_daemon
-				    && protocol_version < 28 ? FERROR
-							     : FWARNING;
+				enum logcode c = am_daemon && protocol_version < 28 ? FERROR : FWARNING;
 				io_error |= IOERR_VANISHED;
 				rprintf(c, "file has vanished: %s\n",
 					full_fname(fname));
@@ -365,6 +366,16 @@ void send_files(int f_in, int f_out)
 			exit_cleanup(RERR_FILEIO);
 		}
 
+		if (append_mode > 0 && st.st_size < F_LENGTH(file)) {
+			rprintf(FWARNING, "skipped diminished file: %s\n",
+				full_fname(fname));
+			free_sums(s);
+			close(fd);
+			if (protocol_version >= 30)
+				send_msg_int(MSG_NO_SEND, ndx);
+			continue;
+		}
+
 		if (st.st_size) {
 			int32 read_size = MAX(s->blength * 3, MAX_MAP_SIZE);
 			mbuf = map_file(fd, st.st_size, read_size, s->blength);
@@ -376,8 +387,7 @@ void send_files(int f_in, int f_out)
 				path,slash,fname, big_num(st.st_size));
 		}
 
-		write_ndx_and_attrs(f_out, ndx, iflags, fname, file,
-				    fnamecmp_type, xname, xlen);
+		write_ndx_and_attrs(f_out, ndx, iflags, fname, file, fnamecmp_type, xname, xlen);
 		write_sum_head(f_xfer, s);
 
 		if (DEBUG_GTE(DELTASUM, 2))
@@ -393,6 +403,8 @@ void send_files(int f_in, int f_out)
 		match_sums(f_xfer, s, mbuf, st.st_size);
 		if (INFO_GTE(PROGRESS, 1))
 			end_progress(st.st_size);
+		else if (want_progress_now)
+			instant_progress(fname);
 
 		log_item(log_code, file, iflags, NULL);
 

@@ -1,7 +1,7 @@
 /*
  * Allow an arbitrary sequence of case labels.
  *
- * Copyright (C) 2006-2019 Wayne Davison
+ * Copyright (C) 2006-2020 Wayne Davison
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,7 +17,7 @@
  * with this program; if not, visit the http://fsf.org website.
  */
 
-/* This is included multiple times, once for every segement in a switch statement.
+/* This is included multiple times, once for every segment in a switch statement.
  * This produces the next "case N:" statement in sequence. */
 
 #if !defined CASE_N_STATE_0

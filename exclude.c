@@ -4,7 +4,7 @@
  * Copyright (C) 1996-2001 Andrew Tridgell <tridge@samba.org>
  * Copyright (C) 1996 Paul Mackerras
  * Copyright (C) 2002 Martin Pool
- * Copyright (C) 2003-2019 Wayne Davison
+ * Copyright (C) 2003-2020 Wayne Davison
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@
  */
 
 #include "rsync.h"
+#include "ifuncs.h"
 
 extern int am_server;
 extern int am_sender;
@@ -199,8 +200,7 @@ static void add_rule(filter_rule_list *listp, const char *pat, unsigned int pat_
 	} else
 		suf_len = 0;
 
-	if (!(rule->pattern = new_array(char, pre_len + pat_len + suf_len + 1)))
-		out_of_memory("add_rule");
+	rule->pattern = new_array(char, pre_len + pat_len + suf_len + 1);
 	if (pre_len) {
 		memcpy(rule->pattern, dirbuf + module_dirlen, pre_len);
 		for (cp = rule->pattern; cp < rule->pattern + pre_len; cp++) {
@@ -261,19 +261,14 @@ static void add_rule(filter_rule_list *listp, const char *pat, unsigned int pat_
 			}
 		}
 
-		if (!(lp = new_array0(filter_rule_list, 1)))
-			out_of_memory("add_rule");
+		lp = new_array0(filter_rule_list, 1);
 		if (asprintf(&lp->debug_type, " [per-dir %s]", cp) < 0)
 			out_of_memory("add_rule");
 		rule->u.mergelist = lp;
 
 		if (mergelist_cnt == mergelist_size) {
 			mergelist_size += 5;
-			mergelist_parents = realloc_array(mergelist_parents,
-						filter_rule *,
-						mergelist_size);
-			if (!mergelist_parents)
-				out_of_memory("add_rule");
+			mergelist_parents = realloc_array(mergelist_parents, filter_rule *, mergelist_size);
 		}
 		if (DEBUG_GTE(FILTER, 2)) {
 			rprintf(FINFO, "[%s] activating mergelist #%d%s\n",
@@ -497,8 +492,6 @@ void *push_local_filters(const char *dir, unsigned int dirlen)
 	push = (struct local_filter_state *)new_array(char,
 			  sizeof (struct local_filter_state)
 			+ (mergelist_cnt-1) * sizeof (filter_rule_list));
-	if (!push)
-		out_of_memory("push_local_filters");
 
 	push->mergelist_cnt = mergelist_cnt;
 	for (i = 0; i < mergelist_cnt; i++) {
@@ -821,8 +814,7 @@ static filter_rule *parse_rule_tok(const char **rulestr_ptr,
 	if (!*s)
 		return NULL;
 
-	if (!(rule = new0(filter_rule)))
-		out_of_memory("parse_rule_tok");
+	rule = new0(filter_rule);
 
 	/* Inherit from the template.  Don't inherit FILTRULES_SIDES; we check
 	 * that later. */
@@ -1051,16 +1043,6 @@ static filter_rule *parse_rule_tok(const char **rulestr_ptr,
 	return rule;
 }
 
-static char default_cvsignore[] =
-	/* These default ignored items come from the CVS manual. */
-	"RCS SCCS CVS CVS.adm RCSLOG cvslog.* tags TAGS"
-	" .make.state .nse_depinfo *~ #* .#* ,* _$* *$"
-	" *.old *.bak *.BAK *.orig *.rej .del-*"
-	" *.a *.olb *.o *.obj *.so *.exe"
-	" *.Z *.elc *.ln core"
-	/* The rest we added to suit ourself. */
-	" .svn/ .git/ .hg/ .bzr/";
-
 static void get_cvs_excludes(uint32 rflags)
 {
 	static int initialized = 0;
@@ -1070,7 +1052,7 @@ static void get_cvs_excludes(uint32 rflags)
 		return;
 	initialized = 1;
 
-	parse_filter_str(&cvs_filter_list, default_cvsignore,
+	parse_filter_str(&cvs_filter_list, default_cvsignore(),
 			 rule_template(rflags | (protocol_version >= 30 ? FILTRULE_PERISHABLE : 0)),
 			 0);
 
@@ -1134,8 +1116,7 @@ void parse_filter_str(filter_rule_list *listp, const char *rulestr,
 				const char *name;
 				filter_rule *excl_self;
 
-				if (!(excl_self = new0(filter_rule)))
-					out_of_memory("parse_filter_str");
+				excl_self = new0(filter_rule);
 				/* Find the beginning of the basename and add an exclude for it. */
 				for (name = pat + pat_len; name > pat && name[-1] != '/'; name--) {}
 				add_rule(listp, name, (pat + pat_len) - name, excl_self, 0);
@@ -1406,8 +1387,7 @@ void recv_filter_list(int f_in)
 	char line[BIGPATHBUFLEN];
 	int xflags = protocol_version >= 29 ? 0 : XFLG_OLD_PREFIXES;
 	int receiver_wants_list = prune_empty_dirs
-	    || (delete_mode
-	     && (!delete_excluded || protocol_version >= 29));
+	    || (delete_mode && (!delete_excluded || protocol_version >= 29));
 	unsigned int len;
 
 	if (!local_server && (am_sender || receiver_wants_list)) {

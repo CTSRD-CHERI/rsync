@@ -4,7 +4,7 @@
  * Copyright (C) 1996-2000 Andrew Tridgell
  * Copyright (C) 1996 Paul Mackerras
  * Copyright (C) 2001, 2002 Martin Pool <mbp@samba.org>
- * Copyright (C) 2003-2019 Wayne Davison
+ * Copyright (C) 2003-2022 Wayne Davison
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -27,11 +27,13 @@
 
 extern int dry_run;
 extern int module_id;
+extern int do_fsync;
 extern int protect_args;
 extern int modify_window;
 extern int relative_paths;
-extern int preserve_times;
+extern int preserve_mtimes;
 extern int preserve_xattrs;
+extern int omit_link_times;
 extern int preallocate_files;
 extern char *module_dir;
 extern unsigned int module_dirlen;
@@ -117,20 +119,21 @@ void print_child_argv(const char *prefix, char **cmd)
 
 /* This returns 0 for success, 1 for a symlink if symlink time-setting
  * is not possible, or -1 for any other error. */
-int set_modtime(const char *fname, time_t modtime, uint32 mod_nsec, mode_t mode)
+int set_times(const char *fname, STRUCT_STAT *stp)
 {
 	static int switch_step = 0;
 
 	if (DEBUG_GTE(TIME, 1)) {
-		rprintf(FINFO, "set modtime of %s to (%ld) %s",
-			fname, (long)modtime,
-			asctime(localtime(&modtime)));
+		rprintf(FINFO,
+			"set modtime, atime of %s to (%ld) %s, (%ld) %s\n",
+			fname, (long)stp->st_mtime,
+			timestring(stp->st_mtime), (long)stp->st_atime, timestring(stp->st_atime));
 	}
 
 	switch (switch_step) {
 #ifdef HAVE_SETATTRLIST
 #include "case_N.h"
-		if (do_setattrlist_times(fname, modtime, mod_nsec) == 0)
+		if (do_setattrlist_times(fname, stp) == 0)
 			break;
 		if (errno != ENOSYS)
 			return -1;
@@ -139,7 +142,7 @@ int set_modtime(const char *fname, time_t modtime, uint32 mod_nsec, mode_t mode)
 
 #ifdef HAVE_UTIMENSAT
 #include "case_N.h"
-		if (do_utimensat(fname, modtime, mod_nsec) == 0)
+		if (do_utimensat(fname, stp) == 0)
 			break;
 		if (errno != ENOSYS)
 			return -1;
@@ -148,7 +151,7 @@ int set_modtime(const char *fname, time_t modtime, uint32 mod_nsec, mode_t mode)
 
 #ifdef HAVE_LUTIMES
 #include "case_N.h"
-		if (do_lutimes(fname, modtime, mod_nsec) == 0)
+		if (do_lutimes(fname, stp) == 0)
 			break;
 		if (errno != ENOSYS)
 			return -1;
@@ -157,18 +160,18 @@ int set_modtime(const char *fname, time_t modtime, uint32 mod_nsec, mode_t mode)
 
 #include "case_N.h"
 		switch_step++;
-		if (preserve_times & PRESERVE_LINK_TIMES) {
-			preserve_times &= ~PRESERVE_LINK_TIMES;
-			if (S_ISLNK(mode))
+		if (!omit_link_times) {
+			omit_link_times = 1;
+			if (S_ISLNK(stp->st_mode))
 				return 1;
 		}
 
 #include "case_N.h"
 #ifdef HAVE_UTIMES
-		if (do_utimes(fname, modtime, mod_nsec) == 0)
+		if (do_utimes(fname, stp) == 0)
 			break;
 #else
-		if (do_utime(fname, modtime, mod_nsec) == 0)
+		if (do_utime(fname, stp) == 0)
 			break;
 #endif
 
@@ -405,16 +408,28 @@ int copy_file(const char *source, const char *dest, int ofd, mode_t mode)
 
 	/* Source file might have shrunk since we fstatted it.
 	 * Cut off any extra preallocated zeros from dest file. */
-	if (offset < prealloc_len && do_ftruncate(ofd, offset) < 0) {
+	if (offset < prealloc_len) {
+#ifdef HAVE_FTRUNCATE
 		/* If we fail to truncate, the dest file may be wrong, so we
 		 * must trigger the "partial transfer" error. */
-		rsyserr(FERROR_XFER, errno, "ftruncate %s", full_fname(dest));
+		if (do_ftruncate(ofd, offset) < 0)
+			rsyserr(FERROR_XFER, errno, "ftruncate %s", full_fname(dest));
+#else
+		rprintf(FERROR_XFER, "no ftruncate for over-long pre-alloc: %s", full_fname(dest));
+#endif
+	}
+
+	if (do_fsync && fsync(ofd) < 0) {
+		int save_errno = errno;
+		rsyserr(FERROR, errno, "fsync failed on %s", full_fname(dest));
+		close(ofd);
+		errno = save_errno;
+		return -1;
 	}
 
 	if (close(ofd) < 0) {
 		int save_errno = errno;
-		rsyserr(FERROR_XFER, errno, "close failed on %s",
-			full_fname(dest));
+		rsyserr(FERROR_XFER, errno, "close failed on %s", full_fname(dest));
 		errno = save_errno;
 		return -1;
 	}
@@ -496,6 +511,11 @@ int robust_rename(const char *from, const char *to, const char *partialptr,
 		  int mode)
 {
 	int tries = 4;
+
+	/* A resumed in-place partial-dir transfer might call us with from and
+	 * to pointing to the same buf if the transfer failed yet again. */
+	if (from == to)
+		return 0;
 
 	while (tries--) {
 		if (do_rename(from, to) == 0)
@@ -586,8 +606,7 @@ int lock_range(int fd, int offset, int len)
 }
 
 #define ENSURE_MEMSPACE(buf, type, sz, req) \
-	if ((req) > sz && !(buf = realloc_array(buf, type, sz = MAX(sz * 2, req)))) \
-		out_of_memory("glob_expand")
+	do { if ((req) > sz) buf = realloc_array(buf, type, sz = MAX(sz * 2, req)); } while(0)
 
 static inline void call_glob_match(const char *name, int len, int from_glob,
 				   char *arg, int abpos, int fbpos);
@@ -689,8 +708,7 @@ static inline void call_glob_match(const char *name, int len, int from_glob,
 		glob_match(arg, abpos, fbpos);
 	} else {
 		ENSURE_MEMSPACE(glob.argv, char *, glob.maxargs, glob.argc + 1);
-		if (!(glob.argv[glob.argc++] = strdup(glob.arg_buf)))
-			out_of_memory("glob_match");
+		glob.argv[glob.argc++] = strdup(glob.arg_buf);
 	}
 }
 
@@ -714,11 +732,7 @@ int glob_expand(const char *arg, char ***argv_p, int *argc_p, int *maxargs_p)
 		s = sanitize_path(NULL, arg, "", 0, SP_KEEP_DOT_DIRS);
 	else {
 		s = strdup(arg);
-		if (!s)
-			out_of_memory("glob_expand");
-		clean_fname(s, CFN_KEEP_DOT_DIRS
-			     | CFN_KEEP_TRAILING_SLASH
-			     | CFN_COLLAPSE_DOT_DOT_DIRS);
+		clean_fname(s, CFN_KEEP_DOT_DIRS | CFN_KEEP_TRAILING_SLASH | CFN_COLLAPSE_DOT_DOT_DIRS);
 	}
 
 	ENSURE_MEMSPACE(glob.arg_buf, char, glob.absize, MAXPATHLEN);
@@ -767,8 +781,7 @@ void glob_expand_module(char *base1, char *arg, char ***argv_p, int *argc_p, int
 		return;
 	}
 
-	if (!(arg = strdup(arg)))
-		out_of_memory("glob_expand_module");
+	arg = strdup(arg);
 
 	if (asprintf(&base," %s/", base1) < 0)
 		out_of_memory("glob_expand_module");
@@ -999,8 +1012,7 @@ int clean_fname(char *name, int flags)
  * ALWAYS collapses ".." elements (except for those at the start of the
  * string up to "depth" deep).  If the resulting name would be empty,
  * change it into a ".". */
-char *sanitize_path(char *dest, const char *p, const char *rootdir, int depth,
-		    int flags)
+char *sanitize_path(char *dest, const char *p, const char *rootdir, int depth, int flags)
 {
 	char *start, *sanp;
 	int rlen = 0, drop_dot_dirs = !relative_paths || !(flags & SP_KEEP_DOT_DIRS);
@@ -1014,11 +1026,10 @@ char *sanitize_path(char *dest, const char *p, const char *rootdir, int depth,
 			depth = 0;
 			p++;
 		}
-		if (dest) {
-			if (rlen + plen + 1 >= MAXPATHLEN)
-				return NULL;
-		} else if (!(dest = new_array(char, MAX(rlen + plen + 1, 2))))
-			out_of_memory("sanitize_path");
+		if (!dest)
+			dest = new_array(char, MAX(rlen + plen + 1, 2));
+		else if (rlen + plen + 1 >= MAXPATHLEN)
+			return NULL;
 		if (rlen) { /* only true if p previously started with a slash */
 			memcpy(dest, rootdir, rlen);
 			if (rlen > 1) /* a rootdir of len 1 is "/", so this avoids a 2nd slash */
@@ -1110,6 +1121,7 @@ int change_dir(const char *dir, int set_path_only)
 		skipped_chdir = set_path_only;
 		memcpy(curr_dir, dir, len + 1);
 	} else {
+		unsigned int save_dir_len = curr_dir_len;
 		if (curr_dir_len + 1 + len >= sizeof curr_dir) {
 			errno = ENAMETOOLONG;
 			return 0;
@@ -1119,6 +1131,7 @@ int change_dir(const char *dir, int set_path_only)
 		memcpy(curr_dir + curr_dir_len, dir, len + 1);
 
 		if (!set_path_only && chdir(curr_dir)) {
+			curr_dir_len = save_dir_len;
 			curr_dir[curr_dir_len] = '\0';
 			return 0;
 		}
@@ -1150,13 +1163,10 @@ char *normalize_path(char *path, BOOL force_newbuf, unsigned int *len_ptr)
 			return NULL;
 		curr_dir[curr_dir_len] = '/';
 		memcpy(curr_dir + curr_dir_len + 1, path, len + 1);
-		if (!(path = strdup(curr_dir)))
-			out_of_memory("normalize_path");
+		path = strdup(curr_dir);
 		curr_dir[curr_dir_len] = '\0';
-	} else if (force_newbuf) {
-		if (!(path = strdup(path)))
-			out_of_memory("normalize_path");
-	}
+	} else if (force_newbuf)
+		path = strdup(path);
 
 	len = clean_fname(path, CFN_COLLAPSE_DOT_DOT_DIRS | CFN_DROP_TRAILING_DOT_DIR);
 
@@ -1332,48 +1342,31 @@ int unsafe_symlink(const char *dest, const char *src)
 /* Return the date and time as a string.  Some callers tweak returned buf. */
 char *timestring(time_t t)
 {
-	static char TimeBuf[200];
+	static int ndx = 0;
+	static char buffers[4][20]; /* We support 4 simultaneous timestring results. */
+	char *TimeBuf = buffers[ndx = (ndx + 1) % 4];
 	struct tm *tm = localtime(&t);
-	char *p;
-
-#ifdef HAVE_STRFTIME
-	strftime(TimeBuf, sizeof TimeBuf - 1, "%Y/%m/%d %H:%M:%S", tm);
-#else
-	strlcpy(TimeBuf, asctime(tm), sizeof TimeBuf);
-#endif
-
-	if ((p = strchr(TimeBuf, '\n')) != NULL)
-		*p = '\0';
+	int len = snprintf(TimeBuf, sizeof buffers[0], "%4d/%02d/%02d %02d:%02d:%02d",
+		 (int)tm->tm_year + 1900, (int)tm->tm_mon + 1, (int)tm->tm_mday,
+		 (int)tm->tm_hour, (int)tm->tm_min, (int)tm->tm_sec);
+	assert(len > 0); /* Silence gcc warning */
 
 	return TimeBuf;
 }
 
 /* Determine if two time_t values are equivalent (either exact, or in
  * the modification timestamp window established by --modify-window).
- *
- * @retval 0 if the times should be treated as the same
- *
- * @retval +1 if the first is later
- *
- * @retval -1 if the 2nd is later
- **/
-int cmp_time(time_t f1_sec, unsigned long f1_nsec, time_t f2_sec, unsigned long f2_nsec)
+ * Returns 1 if the times the "same", or 0 if they are different. */
+int same_time(time_t f1_sec, unsigned long f1_nsec, time_t f2_sec, unsigned long f2_nsec)
 {
-	if (f2_sec > f1_sec) {
-		/* The final comparison makes sure that modify_window doesn't overflow a
-		 * time_t, which would mean that f2_sec must be in the equality window. */
-		if (modify_window <= 0 || (f2_sec > f1_sec + modify_window && f1_sec + modify_window > f1_sec))
-			return -1;
-	} else if (f1_sec > f2_sec) {
-		if (modify_window <= 0 || (f1_sec > f2_sec + modify_window && f2_sec + modify_window > f2_sec))
-			return 1;
-	} else if (modify_window < 0) {
-		if (f2_nsec > f1_nsec)
-			return -1;
-		else if (f1_nsec > f2_nsec)
-			return 1;
-	}
-	return 0;
+	if (modify_window == 0)
+		return f1_sec == f2_sec;
+	if (modify_window < 0)
+		return f1_sec == f2_sec && f1_nsec == f2_nsec;
+	/* The nanoseconds do not figure into these checks -- time windows don't care about that. */
+	if (f2_sec > f1_sec)
+		return f2_sec - f1_sec <= modify_window;
+	return f1_sec - f2_sec <= modify_window;
 }
 
 #ifdef __INSURE__XX
@@ -1447,8 +1440,7 @@ const char *find_filename_suffix(const char *fn, int fn_len, int *len_ptr)
 		} else if (s_len == 5) {
 			if (strcmp(s+1, "orig") == 0)
 				continue;
-		} else if (s_len > 2 && had_tilde
-		    && s[1] == '~' && isDigit(s + 2))
+		} else if (s_len > 2 && had_tilde && s[1] == '~' && isDigit(s + 2))
 			continue;
 		*len_ptr = s_len;
 		suf = s;
@@ -1459,7 +1451,7 @@ const char *find_filename_suffix(const char *fn, int fn_len, int *len_ptr)
 			if (!isDigit(s))
 				return suf;
 		}
-		/* An all-digit suffix may not be that signficant. */
+		/* An all-digit suffix may not be that significant. */
 		s = suf;
 	}
 
@@ -1523,8 +1515,8 @@ uint32 fuzzy_distance(const char *s1, unsigned len1, const char *s2, unsigned le
 #define BB_PER_SLOT_INTS (BB_SLOT_SIZE / 4) /* Number of int32s per slot */
 
 struct bitbag {
-    uint32 **bits;
-    int slot_cnt;
+	uint32 **bits;
+	int slot_cnt;
 };
 
 struct bitbag *bitbag_create(int max_ndx)
@@ -1532,8 +1524,7 @@ struct bitbag *bitbag_create(int max_ndx)
 	struct bitbag *bb = new(struct bitbag);
 	bb->slot_cnt = (max_ndx + BB_PER_SLOT_BITS - 1) / BB_PER_SLOT_BITS;
 
-	if (!(bb->bits = (uint32**)calloc(bb->slot_cnt, sizeof (uint32*))))
-		out_of_memory("bitbag_create");
+	bb->bits = new_array0(uint32*, bb->slot_cnt);
 
 	return bb;
 }
@@ -1543,10 +1534,8 @@ void bitbag_set_bit(struct bitbag *bb, int ndx)
 	int slot = ndx / BB_PER_SLOT_BITS;
 	ndx %= BB_PER_SLOT_BITS;
 
-	if (!bb->bits[slot]) {
-		if (!(bb->bits[slot] = (uint32*)calloc(BB_PER_SLOT_INTS, 4)))
-			out_of_memory("bitbag_set_bit");
-	}
+	if (!bb->bits[slot])
+		bb->bits[slot] = new_array0(uint32, BB_PER_SLOT_INTS);
 
 	bb->bits[slot][ndx/32] |= 1u << (ndx % 32);
 }
@@ -1614,8 +1603,7 @@ void flist_ndx_push(flist_ndx_list *lp, int ndx)
 {
 	struct flist_ndx_item *item;
 
-	if (!(item = new(struct flist_ndx_item)))
-		out_of_memory("flist_ndx_push");
+	item = new(struct flist_ndx_item);
 	item->next = NULL;
 	item->ndx = ndx;
 	if (lp->tail)
@@ -1651,35 +1639,32 @@ int flist_ndx_pop(flist_ndx_list *lp)
  * After the size check, the list's count is incremented by 1 and a pointer
  * to the "new" list item is returned.
  */
-void *expand_item_list(item_list *lp, size_t item_size,
-		       const char *desc, int incr)
+void *expand_item_list(item_list *lp, size_t item_size, const char *desc, int incr)
 {
 	/* First time through, 0 <= 0, so list is expanded. */
 	if (lp->malloced <= lp->count) {
 		void *new_ptr;
-		size_t new_size = lp->malloced;
+		size_t expand_size;
 		if (incr < 0)
-			new_size += -incr; /* increase slowly */
-		else if (new_size < (size_t)incr)
-			new_size = incr;
-		else if (new_size)
-			new_size *= 2;
+			expand_size = -incr; /* increase slowly */
+		else if (lp->malloced < (size_t)incr)
+			expand_size = incr - lp->malloced;
+		else if (lp->malloced)
+			expand_size = lp->malloced; /* double in size */
 		else
-			new_size = 1;
-		if (new_size <= lp->malloced)
+			expand_size = 1;
+		if (SIZE_MAX/item_size - expand_size < lp->malloced)
 			overflow_exit("expand_item_list");
-		/* Using _realloc_array() lets us pass the size, not a type. */
-		new_ptr = _realloc_array(lp->items, item_size, new_size);
+		expand_size += lp->malloced;
+		new_ptr = realloc_buf(lp->items, expand_size * item_size);
 		if (DEBUG_GTE(FLIST, 3)) {
 			rprintf(FINFO, "[%s] expand %s to %s bytes, did%s move\n",
-				who_am_i(), desc, big_num(new_size * item_size),
+				who_am_i(), desc, big_num(expand_size * item_size),
 				new_ptr == lp->items ? " not" : "");
 		}
-		if (!new_ptr)
-			out_of_memory("expand_item_list");
 
 		lp->items = new_ptr;
-		lp->malloced = new_size;
+		lp->malloced = expand_size;
 	}
 	return (char*)lp->items + (lp->count++ * item_size);
 }
@@ -1687,7 +1672,7 @@ void *expand_item_list(item_list *lp, size_t item_size,
 /* This zeroing of memory won't be optimized away by the compiler. */
 void force_memzero(void *buf, size_t len)
 {
-    volatile uchar *z = buf;
-    while (len-- > 0)
-	*z++ = '\0';
+	volatile uchar *z = buf;
+	while (len-- > 0)
+		*z++ = '\0';
 }

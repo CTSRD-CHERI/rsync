@@ -1,6 +1,6 @@
-#! /bin/sh
+#!/bin/sh
 
-# Copyright (C) 2003, 2004, 2005 by Wayne Davison <wayned@samba.org>
+# Copyright (C) 2003-2022 Wayne Davison
 
 # This program is distributable under the terms of the GNU GPL (see
 # COPYING).
@@ -113,6 +113,12 @@ rm -rf "$todir"
 # Add a directory symlink.
 ln -s too "$fromdir/bar/down/to/foo/sym"
 
+# Start to prep an --update test dir
+mkdir "$scratchdir/up1" "$scratchdir/up2"
+touch "$scratchdir/up1/dst-newness" "$scratchdir/up2/src-newness"
+touch "$scratchdir/up1/same-newness" "$scratchdir/up2/same-newness"
+touch "$scratchdir/up1/extra-src" "$scratchdir/up2/extra-dest"
+
 # Create chkdir with what we expect to be excluded.
 checkit "$RSYNC -avv '$fromdir/' '$chkdir/'" "$fromdir" "$chkdir"
 sleep 1 # Ensures that the rm commands will tweak the directory times.
@@ -123,6 +129,9 @@ rm -r "$chkdir"/new/lose
 rm "$chkdir"/foo/file[235-9]
 rm "$chkdir"/bar/down/to/foo/to "$chkdir"/bar/down/to/foo/file[235-9]
 rm "$chkdir"/mid/for/foo/extra
+
+# Finish prep for the --update test (run last)
+touch "$scratchdir/up1/src-newness" "$scratchdir/up2/dst-newness"
 
 # Un-tweak the directory times in our first (weak) exclude test (though
 # it's a good test of the --existing option).
@@ -214,6 +223,15 @@ $RSYNC -av $relative_opts --existing --filter='-! */' "$fromdir/foo" "$chkdir/"
 
 checkit "$RSYNC -avv $relative_opts --exclude='$fromdir/foo/down' \
     '$fromdir/foo' '$todir'" "$chkdir$fromdir/foo" "$todir$fromdir/foo"
+
+# Now we'll test the --update option.
+checkdiff "$RSYNC -aiiO --update --info=skip '$scratchdir/up1/' '$scratchdir/up2/'" \
+	"grep -v '^\.d$allspace'" <<EOT
+dst-newness is newer
+>f$all_plus extra-src
+.f$allspace same-newness
+>f..t.$dots src-newness
+EOT
 
 # The script would have aborted on error, so getting here means we've won.
 exit 0

@@ -3,7 +3,7 @@
  * Written by Jay Fenlason, vaguely based on the ACLs patch.
  *
  * Copyright (C) 2004 Red Hat, Inc.
- * Copyright (C) 2006-2019 Wayne Davison
+ * Copyright (C) 2006-2022 Wayne Davison
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -44,8 +44,7 @@ extern int saw_xattr_filter;
 
 #define MAX_FULL_DATUM 32
 
-#define HAS_PREFIX(str, prfx) (*(str) == *(prfx) \
-			    && strncmp(str, prfx, sizeof (prfx) - 1) == 0)
+#define HAS_PREFIX(str, prfx) (*(str) == *(prfx) && strncmp(str, prfx, sizeof (prfx) - 1) == 0)
 
 #define XATTR_ABBREV(x) ((size_t)((x).name - (x).datum) < (x).datum_len)
 
@@ -59,7 +58,7 @@ extern int saw_xattr_filter;
 #define SPRE_LEN ((int)sizeof SYSTEM_PREFIX - 1)
 
 #ifdef HAVE_LINUX_XATTRS
-#define MIGHT_NEED_RPRE (am_root < 0)
+#define MIGHT_NEED_RPRE (am_root <= 0)
 #define RSYNC_PREFIX USER_PREFIX "rsync."
 #else
 #define MIGHT_NEED_RPRE am_root
@@ -146,8 +145,6 @@ static ssize_t get_xattr_names(const char *fname)
 	if (!namebuf) {
 		namebuf_len = 1024;
 		namebuf = new_array(char, namebuf_len);
-		if (!namebuf)
-			out_of_memory("get_xattr_names");
 	}
 
 	while (1) {
@@ -175,8 +172,6 @@ static ssize_t get_xattr_names(const char *fname)
 			free(namebuf);
 		namebuf_len = list_len + 1024;
 		namebuf = new_array(char, namebuf_len);
-		if (!namebuf)
-			out_of_memory("get_xattr_names");
 	}
 
 	return list_len;
@@ -185,8 +180,7 @@ static ssize_t get_xattr_names(const char *fname)
 /* On entry, the *len_ptr parameter contains the size of the extra space we
  * should allocate when we create a buffer for the data.  On exit, it contains
  * the length of the datum. */
-static char *get_xattr_data(const char *fname, const char *name, size_t *len_ptr,
-			    int no_missing_error)
+static char *get_xattr_data(const char *fname, const char *name, size_t *len_ptr, int no_missing_error)
 {
 	size_t datum_len = sys_lgetxattr(fname, name, NULL, 0);
 	size_t extra_len = *len_ptr;
@@ -205,23 +199,22 @@ static char *get_xattr_data(const char *fname, const char *name, size_t *len_ptr
 
 	if (!datum_len && !extra_len)
 		extra_len = 1; /* request non-zero amount of memory */
-	if (datum_len + extra_len < datum_len)
+	if (SIZE_MAX - datum_len < extra_len)
 		overflow_exit("get_xattr_data");
-	if (!(ptr = new_array(char, datum_len + extra_len)))
-		out_of_memory("get_xattr_data");
+	ptr = new_array(char, datum_len + extra_len);
 
 	if (datum_len) {
 		size_t len = sys_lgetxattr(fname, name, ptr, datum_len);
 		if (len != datum_len) {
 			if (len == (size_t)-1) {
 				rsyserr(FERROR_XFER, errno,
-				    "get_xattr_data: lgetxattr(%s,\"%s\",%ld) failed",
-				    full_fname(fname), name, (long)datum_len);
+					"get_xattr_data: lgetxattr(%s,\"%s\",%ld) failed",
+					full_fname(fname), name, (long)datum_len);
 			} else {
 				rprintf(FERROR_XFER,
-				    "get_xattr_data: lgetxattr(%s,\"%s\",%ld) returned %ld\n",
-				    full_fname(fname), name,
-				    (long)datum_len, (long)len);
+					"get_xattr_data: lgetxattr(%s,\"%s\",%ld) returned %ld\n",
+					full_fname(fname), name,
+					(long)datum_len, (long)len);
 			}
 			free(ptr);
 			return NULL;
@@ -281,8 +274,7 @@ static int rsync_xal_get(const char *fname, item_list *xalp)
 			sum_update(ptr, datum_len);
 			free(ptr);
 
-			if (!(ptr = new_array(char, name_offset + name_len)))
-				out_of_memory("rsync_xal_get");
+			ptr = new_array(char, name_offset + name_len);
 			*ptr = XSTATE_ABBREV;
 			sum_end(ptr + 1);
 		} else
@@ -415,7 +407,7 @@ static int find_matching_xattr(const item_list *xalp)
 
 	key = xattr_lookup_hash(xalp);
 
-	node = hashtable_find(rsync_xal_h, key, 0);
+	node = hashtable_find(rsync_xal_h, key, NULL);
 	if (node == NULL)
 		return -1;
 
@@ -478,21 +470,15 @@ static int rsync_xal_store(item_list *xalp)
 	new_list->key = xattr_lookup_hash(&new_list->xa_items);
 
 	if (rsync_xal_h == NULL)
-		rsync_xal_h = hashtable_create(512, 1);
+		rsync_xal_h = hashtable_create(512, HT_KEY64);
 	if (rsync_xal_h == NULL)
 		out_of_memory("rsync_xal_h hashtable_create()");
 
-	node = hashtable_find(rsync_xal_h, new_list->key, 1);
-	if (node == NULL)
-		out_of_memory("rsync_xal_h hashtable_find()");
-
 	new_ref = new0(rsync_xa_list_ref);
-	if (new_ref == NULL)
-		out_of_memory("new0(rsync_xa_list_ref)");
-
 	new_ref->ndx = ndx;
 
-	if (node->data != NULL) {
+	node = hashtable_find(rsync_xal_h, new_list->key, new_ref);
+	if (node->data != (void*)new_ref) {
 		rsync_xa_list_ref *ref = node->data;
 
 		while (ref != NULL) {
@@ -504,8 +490,7 @@ static int rsync_xal_store(item_list *xalp)
 			ref->next = new_ref;
 			break;
 		}
-	} else
-		node->data = new_ref;
+	}
 
 	return ndx;
 }
@@ -719,7 +704,7 @@ int recv_xattr_request(struct file_struct *file, int f_in)
 		num += rel_pos;
 		if (am_sender) {
 			/* The sender-related num values are only in order on the sender.
-			 * We use that order here to scan foward or backward as needed. */
+			 * We use that order here to scan forward or backward as needed. */
 			if (rel_pos < 0) {
 				while (cnt < (int)lst->count && rxa->num > num) {
 					rxa--;
@@ -763,11 +748,9 @@ int recv_xattr_request(struct file_struct *file, int f_in)
 		old_datum = rxa->datum;
 		rxa->datum_len = read_varint(f_in);
 
-		if (rxa->name_len + rxa->datum_len < rxa->name_len)
+		if (SIZE_MAX - rxa->name_len < rxa->datum_len)
 			overflow_exit("recv_xattr_request");
 		rxa->datum = new_array(char, rxa->datum_len + rxa->name_len);
-		if (!rxa->datum)
-			out_of_memory("recv_xattr_request");
 		name = rxa->datum + rxa->datum_len;
 		memcpy(name, rxa->name, rxa->name_len);
 		rxa->name = name;
@@ -816,12 +799,9 @@ void receive_xattr(int f, struct file_struct *file)
 		size_t datum_len = read_varint(f);
 		size_t dget_len = datum_len > MAX_FULL_DATUM ? 1 + MAX_DIGEST_LEN : datum_len;
 		size_t extra_len = MIGHT_NEED_RPRE ? RPRE_LEN : 0;
-		if ((dget_len + extra_len < dget_len)
-		 || (dget_len + extra_len + name_len < dget_len + extra_len))
+		if (SIZE_MAX - dget_len < extra_len || SIZE_MAX - dget_len - extra_len < name_len)
 			overflow_exit("receive_xattr");
 		ptr = new_array(char, dget_len + extra_len + name_len);
-		if (!ptr)
-			out_of_memory("receive_xattr");
 		name = ptr + dget_len + extra_len;
 		read_buf(f, name, name_len);
 		if (name_len < 1 || name[name_len-1] != '\0') {
@@ -926,7 +906,7 @@ void uncache_tmp_xattrs(void)
 			if (rsync_xal_h == NULL)
 				continue;
 
-			node = hashtable_find(rsync_xal_h, xa_list_item->key, 0);
+			node = hashtable_find(rsync_xal_h, xa_list_item->key, NULL);
 			if (node == NULL)
 				continue;
 
@@ -941,17 +921,16 @@ void uncache_tmp_xattrs(void)
 				continue;
 			}
 
-			while (ref != NULL) {
-				if (ref->next == NULL) {
-					ref = NULL;
+			while (1) {
+				rsync_xa_list_ref *next = ref->next;
+				if (next == NULL)
+					break;
+				if (xa_list_item->ndx == next->ndx) {
+					ref->next = next->next;
+					free(next);
 					break;
 				}
-				if (xa_list_item->ndx == ref->next->ndx) {
-					ref->next = ref->next->next;
-					free(ref);
-					break;
-				}
-				ref = ref->next;
+				ref = next;
 			}
 		}
 		prior_xattr_count = (size_t)-1;
@@ -1072,12 +1051,11 @@ static int rsync_xal_set(const char *fname, item_list *xalp,
 }
 
 /* Set extended attributes on indicated filename. */
-int set_xattr(const char *fname, const struct file_struct *file,
-	      const char *fnamecmp, stat_x *sxp)
+int set_xattr(const char *fname, const struct file_struct *file, const char *fnamecmp, stat_x *sxp)
 {
 	rsync_xa_list *glst = rsync_xal_l.items;
 	item_list *lst;
-	int ndx;
+	int ndx, added_write_perm = 0;
 
 	if (dry_run)
 		return 1; /* FIXME: --dry-run needs to compute this value */
@@ -1106,10 +1084,23 @@ int set_xattr(const char *fname, const struct file_struct *file,
 	}
 #endif
 
+	/* If the target file lacks write permission, we try to add it
+	 * temporarily so we can change the extended attributes. */
+	if (!am_root
+#ifdef SUPPORT_LINKS
+	 && !S_ISLNK(sxp->st.st_mode)
+#endif
+	 && access(fname, W_OK) < 0
+	 && do_chmod(fname, (sxp->st.st_mode & CHMOD_BITS) | S_IWUSR) == 0)
+		added_write_perm = 1;
+
 	ndx = F_XATTR(file);
 	glst += ndx;
 	lst = &glst->xa_items;
-	return rsync_xal_set(fname, lst, fnamecmp, sxp);
+	int return_value = rsync_xal_set(fname, lst, fnamecmp, sxp);
+	if (added_write_perm) /* remove the temporary write permission */
+		do_chmod(fname, sxp->st.st_mode);
+	return return_value;
 }
 
 #ifdef SUPPORT_ACLS
@@ -1140,7 +1131,8 @@ int del_def_xattr_acl(const char *fname)
 
 int get_stat_xattr(const char *fname, int fd, STRUCT_STAT *fst, STRUCT_STAT *xst)
 {
-	int mode, rdev_major, rdev_minor, uid, gid, len;
+	unsigned int mode;
+	int rdev_major, rdev_minor, uid, gid, len;
 	char buf[256];
 
 	if (am_root >= 0 || IS_DEVICE(fst->st_mode) || IS_SPECIAL(fst->st_mode))
